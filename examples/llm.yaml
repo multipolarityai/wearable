@@ -1,0 +1,18 @@
+version: "0.1"
+endpoint: http://127.0.0.1:11434/api/chat
+model: qwen2.5:1.5b
+adapters:
+  llm.draft:
+    capability: draft_text
+    system: Write a helpful answer in at most 80 words to the request. Return event ok and the answer in output.text.
+    prompt: 'Request: $request'
+  llm.check:
+    capability: check_text
+    system: Check the answer for clarity and internal consistency. Return pass if adequate, otherwise revise. Accept understandable answers without demanding stylistic rewrites. Put at most 30 words of actionable feedback in output.feedback (empty when passing).
+    prompt: 'Answer: $text'
+  llm.revise:
+    capability: revise_text
+    system: Improve the answer using the feedback, in at most 80 words. Return event ok and the revised answer in output.text.
+    prompt: |
+      Answer: $text
+      Feedback: $feedback

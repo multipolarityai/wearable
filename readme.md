@@ -2,7 +2,7 @@
 
 A foundation for declarative AI agents: describe a machine in YAML, validate and compile it into a runtime-independent plan, then execute that plan through explicitly registered capabilities.
 
-**Status: minimal working Python prototype.** The v0.1 YAML contract is implemented by a strict loader, validator/compiler and sequential interpreter. The example runs with deterministic offline stub tools; there are no model-provider integrations.
+**Status: minimal working Python prototype.** The v0.1 YAML contract is implemented by a strict loader, validator/compiler and sequential interpreter. The example runs with deterministic offline stub tools; an optional Ollama adapter enables real local inference.
 
 ## Run the prototype
 
@@ -33,12 +33,62 @@ print(result["context"]["values"]["answer"])
 
 `wearable.py` holds the loader, compiler, immutable plan, executor and CLI. `stub_tools.py` holds the three example adapters. An adapter is an `Adapter(inputs, outputs, events, call)` record; the first three arguments are tuples of field/event names and `call` is an async function accepting a dictionary and returning `{event, output}`. The registry is checked at compilation and again before execution. Plans contain declarations, not live functions.
 
+### Real local inference (optional)
+
+Install [Ollama](https://docs.ollama.com/quickstart) on the machine running the app. Start the Ollama app/service (or run `ollama serve` in another terminal if it is not already running), then:
+
+```sh
+ollama pull qwen2.5:1.5b
+python -m wearable --llm examples/llm.yaml --runtime examples/runtime-llm.yaml --request "Explain finite-state agents"
+```
+
+The pull downloads model weights once. Subsequent local inference needs no internet or API key. The example [Qwen2.5 1.5B model](https://ollama.com/library/qwen2.5:1.5b) has an approximately 986 MB download; inference needs additional RAM for runtime overhead and context. A small quantized model is useful for experimentation, but its checking/reasoning quality is limited. CPU inference is possible; speed depends on hardware. A VM or sandbox is not required: Ollama runs as a separate native service. Containers/VMs are optional deployment choices.
+
+`examples/llm.yaml` defines the Ollama chat endpoint, model and per-adapter system/user prompts. Change `model` to an already installed model to avoid another download. User prompt templates use `$request`, `$text` and `$feedback` from declared inputs (`$$` means a literal dollar). System prompts are literal strings. Unknown placeholders fail validation before any request. `examples/runtime-llm.yaml` allows 120 seconds per action for local inference/cold starts; the ordinary runtime and default CLI remain offline.
+
+The adapter sends a non-streaming [Ollama chat request](https://docs.ollama.com/api/chat) with a JSON schema derived from the tool's event/output contract. Temperature is fixed at 0 and generation is limited to 512 tokens to keep this prototype small. The executor still validates returned JSON; HTTP errors, incomplete replies, invalid JSON and contract violations follow the existing `error` transition. No automatic retry or fallback to stubs occurs. Acceptance is a model judgment, not a correctness guarantee. The checker currently sees only the answer, not the original request.
+
+Programmatically, construct a registry with `llm_tools.build_registry(load_yaml("examples/llm.yaml"), load_yaml("examples/tools.yaml"))`, then pass it to `load_plan` and `run` in place of `REGISTRY`. The executor owns the overall timeout and the async HTTP client supports cancellation; a disconnected request does not guarantee that the server has stopped computing.
+
+Deployment: run Ollama beside the Python app and use the loopback endpoint. If they run in separate containers, `127.0.0.1` refers to each container itself; configure the endpoint to reach the Ollama service over the private container network. Local Ollama [does not require authentication](https://docs.ollama.com/api/authentication), so keep that service private. This minimal adapter implements the native Ollama API, not arbitrary hosted providers or OpenAI-compatible APIs.
+
+For a leaner native model server, [llama.cpp](https://github.com/ggml-org/llama.cpp) is another option, but its chat API would need a separate adapter. Hosted inference can avoid downloading weights, although free access and credential-free API access are different: [Hugging Face Inference Providers](https://huggingface.co/docs/inference-providers/en/index) requires a token, and Ollama cloud requires authentication. Public demos are not a dependable backend for this prototype.
+
+The tests mock HTTP and run entirely offline. A live one-action smoke test with the installed LFM2.5 1.2B model accepted and resumed from SQLite without another inference. A longer live draft/check/revise run exhausted its budget because the model repeatedly requested revision; another model run correctly rejected malformed JSON. The example Qwen model was not downloaded or live-tested. Model-specific output quality is not an automated test guarantee.
+
+### Durable state and resume
+
+Use a SQLite database and a unique run ID:
+
+```sh
+python -m wearable --request "Explain agents" --checkpoint runs.sqlite --run-id demo-1
+python -m wearable --request "Explain agents" --checkpoint runs.sqlite --run-id demo-1 --resume
+```
+
+Add the same `--llm` and `--runtime` flags to both commands for a real model run. A completed run returns its stored result without another tool/model call. A new invocation with an existing run ID fails unless `--resume` is supplied. In Python, pass `checkpoint=Checkpoint("runs.sqlite", "demo-1")` from `checkpoints`, with `resume=True` when needed.
+
+Each checkpoint contains state, input/results/value context, consumed steps, trace and completion status. It is tied to a fingerprint of the plan, input and adapter identities; changed prompts/models/configuration cannot silently resume an older run. Custom adapter authors must bump `Adapter.identity` when changing behavior. Local model tags can change their underlying weights; pin/manage installed model versions for reproducibility. Checkpoints are not model-weight snapshots or guarantees of identical generations.
+
+Before invoking a tool, the runner atomically records a pending call and reserves its step. After the call, it atomically records the result and transition. If the process dies after a completed transition, resume continues from that state. If it dies during a call, ordinary resume stops: the tool may already have performed its side effect.
+
+Only after stopping the old process and checking whether repetition is safe, add `--resume --retry-pending` to explicitly repeat an interrupted call. A retry consumes another step; the original attempt remains counted, so the budget cannot be reset by restarting. Trace step numbers can consequently have gaps for interrupted attempts. If the budget is already exhausted, no further call occurs. There is no exactly-once guarantee for external effects. Use idempotent operations or adapter-level idempotency keys before adding mutating tools.
+
+SQLite compare-and-swap revisions reject stale writers. This is a single-runner deployment model, not a distributed scheduler or lease manager; never retry a pending call while its original runner is active. Store the database on a persistent local volume when deploying in a container. It contains prompts and outputs as plaintext and should be treated as application data.
+
+### Wearables around other agent runtimes
+
+Wearable can serve as an overlay around a larger SDK: each state invokes an adapter that runs an SDK agent and translates its final output into `{event, output}`. The outer YAML retains the workflow graph, boundary contracts, budget and checkpoints. The inner SDK retains its own tools, sessions and execution loop.
+
+For example, a `research` state could invoke a Claude agent, return `complete` or `needs_review`, and let Wearable select the next declared state. An OpenAI agent or Google ADK workflow could be used behind another adapter without changing the outer executor. These SDK adapters are extension points, not implemented integrations.
+
+Outer constraints do not automatically govern every internal tool call. An invocation budget counts adapter calls, not the inner agent's model/tool calls; its session persistence is also separate. Enforcing those inner permissions, budgets and resumability requires SDK-specific hooks. This boundary is the useful abstraction: inspectable orchestration without recreating every runtime's features. There are no benchmarks claiming a speed or cost advantage over equivalent imperative workflows.
+
 ### Deliberate prototype limits
 
 - Only string fields, explicit references, sequential execution and the `sequential` backend are supported. All declared capabilities must have compatible registered adapters.
 - PyYAML SafeLoader syntax is used. Quote the `"on"` key, as the examples do, because YAML 1.1 treats bare `on` as a boolean. Duplicate keys, aliases, custom tags and unknown declaration fields are rejected. Documents are limited to 64 KiB and 40 nesting levels.
 - Adapters are trusted, cooperative async Python functions. `asyncio.timeout` cancels an awaiting call; it cannot interrupt blocking code or an adapter that suppresses cancellation. This is not a process sandbox or a hard wall-clock limit. External cancellation propagates, and side effects are not rolled back.
-- Each run has independent context and a bounded invocation count. The returned trace records state/event/target and the exception class on error. Results include context for every status, including budget exhaustion. There are no retries or persistence.
+- Each run has independent context and a bounded invocation count. The returned trace records state/event/target and the exception class on error. Results include context for every status, including budget exhaustion. Optional SQLite checkpoints support restart/resume. There are no automatic retries.
 
 The following sections retain the algorithmic rationale and pseudocode behind the implementation.
 
@@ -114,7 +164,7 @@ draft --ok--> check --revise--> revise --ok--> check --pass--> done
 
 Here `draft` and `revise` both write a named result field into `context.values.answer` using `save`. The checker reads it through `{value: answer}`. A value reference is an additional explicit reference form, subject to the same definite-assignment rule. This avoids requiring the checker to know which state last produced the answer. Saved values are string slots, declared in `values`, and are updated only after a successful, contract-valid action result.
 
-The example uses offline stubs under model-style adapter IDs. For real model calls, a host would have to implement `llm.draft`, `llm.check`, and `llm.revise`, including any prompts, credentials and provider-specific calls. A model's `pass` event is a routing decision, not proof that its answer is correct.
+The example uses offline stubs under model-style adapter IDs. The optional Ollama registry supplies real model calls for `llm.draft`, `llm.check`, and `llm.revise`, using YAML prompts and the local Ollama API. A model's `pass` event is a routing decision, not proof that its answer is correct.
 
 ## 4. Compilation algorithm
 
@@ -224,7 +274,7 @@ RUN(plan, input, adapters):
 
 The reserved `error` event is generated by the executor; adapters return only their declared events. Failed invocations leave earlier results and values unchanged. Every invocation consumes a step, including errors. A transition reaching a terminal on the final allowed step succeeds because terminal handling precedes the next budget check.
 
-A missing binding or transition after compilation is a host/plan integrity error: stop execution rather than asking the model to improvise. The minimal engine performs no automatic retries. The host must enforce timeout behavior; cancellation does not roll back remote side effects. Durable execution, retries and idempotency need separate semantics later.
+A missing binding or transition after compilation is a host/plan integrity error: stop execution rather than asking the model to improvise. The minimal engine performs no automatic retries. The host must enforce timeout behavior; cancellation does not roll back remote side effects. The optional checkpoint layer below defines restart behavior; external side-effect idempotency remains the adapter's responsibility.
 
 A run returns `accept`, `reject`, or `budget_exhausted`, alongside its final state and trace (and context for terminal results). Budget exhaustion is an operational stop, not rejection by the formal machine. The step budget bounds invocations; it bounds elapsed time only when the host reliably enforces action timeouts.
 
@@ -269,4 +319,4 @@ These behavioral specifications are exercised by the standard-library unittest s
 
 The prototype implements the safe YAML loader, validation into an immutable Plan, sequential interpreter, and in-memory stub adapter registry. The plan retains validated declarations rather than generating bytecode. Tests cover the cases above plus cancellation, immutable plans, input validation and independent runs.
 
-Provider integrations, arbitrary runtime configurations, JSON Schema support, streaming, persistence, parallel states, multi-agent coordination, sandboxing, retries, formal model checking and a tape executor are future work. Supporting new configuration types should mean extending a versioned grammar and adapter contract, not promising that arbitrary YAML can execute.
+Additional provider integrations, arbitrary runtime configurations, JSON Schema support, streaming, distributed persistence, parallel states, multi-agent coordination, sandboxing, retries, formal model checking and a tape executor are future work. Supporting new configuration types should mean extending a versioned grammar and adapter contract, not promising that arbitrary YAML can execute.

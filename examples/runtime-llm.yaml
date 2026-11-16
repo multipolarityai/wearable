@@ -1,0 +1,9 @@
+version: "0.1"
+backend: sequential
+bindings:
+  draft_text: llm.draft
+  check_text: llm.check
+  revise_text: llm.revise
+limits:
+  max_steps: 8
+  action_timeout_ms: 120000

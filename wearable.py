@@ -5,6 +5,7 @@ import argparse
 import asyncio
 import inspect
 import json
+import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
@@ -88,6 +89,7 @@ class Adapter:
     outputs: tuple[str, ...]
     events: tuple[str, ...]
     call: Callable  # async function accepting a dict and returning an envelope
+    identity: str = "v1"  # bump when custom adapter behavior changes
 
 
 @dataclass(frozen=True)
@@ -221,7 +223,7 @@ def load_plan(agent, tools, runtime, registry):
     return compile_agent(load_yaml(agent), load_yaml(tools), load_yaml(runtime), registry)
 
 
-async def run(plan, inputs, registry):
+async def run(plan, inputs, registry, *, checkpoint=None, resume=False, retry_pending=False):
     """Run trusted, cooperative async adapters; cancellation is not rollback."""
     bound = bind(plan, registry)
     fields(inputs, set(plan.agent['inputs']), set(), 'input')
@@ -229,11 +231,30 @@ async def run(plan, inputs, registry):
     context = {'input': dict(inputs), 'results': {}, 'values': {}}
     state, steps, trace = plan.agent['initial'], 0, []
     limits = plan.runtime['limits']
+    phase = 'ready'
+    if checkpoint is None and (resume or retry_pending):
+        raise ValidationError('resume/retry_pending requires a checkpoint')
+
+    def snapshot(current_phase, result=None):
+        return dict(phase=current_phase, state=state, context=context, steps=steps, trace=trace, result=result)
+
+    if checkpoint is not None:
+        from checkpoints import fingerprint
+        signature = fingerprint({'format': 1, 'agent': plan.agent, 'tools': plan.capabilities,
+                                 'runtime': plan.runtime, 'inputs': inputs,
+                                 'adapters': {key: registry[key].identity for key in plan.runtime['bindings'].values()}})
+        saved = checkpoint.start(signature, snapshot(phase), resume=resume, retry_pending=retry_pending)
+        if saved['phase'] == 'done':
+            return saved['result']
+        state, context, steps, trace, phase = (saved[k] for k in ('state', 'context', 'steps', 'trace', 'phase'))
     while True:
         spec = plan.agent['states'][state]
         status = spec.get('terminal')
         if status or steps == limits['max_steps']:
-            return dict(status=status or 'budget_exhausted', state=state, context=context, steps=steps, trace=trace)
+            result = dict(status=status or 'budget_exhausted', state=state, context=context, steps=steps, trace=trace)
+            if checkpoint is not None:
+                checkpoint.save(snapshot('done', result))
+            return result
         args = {}
         for key, ref in spec['inputs'].items():
             if 'input' in ref:
@@ -243,6 +264,9 @@ async def run(plan, inputs, registry):
             else:
                 args[key] = context['results'][ref['result']][ref['field']]
         steps += 1
+        if checkpoint is not None:
+            checkpoint.save(snapshot('pending'))
+        phase = 'ready'
         try:
             async with asyncio.timeout(limits['action_timeout_ms'] / 1000):
                 reply = await bound[spec['action']](args)
@@ -264,6 +288,8 @@ async def run(plan, inputs, registry):
             entry['error'] = error
         trace.append(entry)
         state = target
+        if checkpoint is not None:
+            checkpoint.save(snapshot('ready'))
 
 
 def main():
@@ -273,12 +299,30 @@ def main():
     parser.add_argument('--agent', default='examples/agent.yaml')
     parser.add_argument('--tools', default='examples/tools.yaml')
     parser.add_argument('--runtime', default='examples/runtime.yaml')
+    parser.add_argument('--checkpoint', help='SQLite file for durable state')
+    parser.add_argument('--run-id', help='Run ID within the checkpoint database')
+    parser.add_argument('--resume', action='store_true')
+    parser.add_argument('--retry-pending', action='store_true', help='Retry an interrupted call only after checking its side effects')
+    parser.add_argument('--llm', help='Ollama model/prompt YAML; omit for offline stubs')
     parser.add_argument('--request', default='Explain finite-state agents')
     args = parser.parse_args()
+    from checkpoints import Checkpoint, CheckpointError
+    if bool(args.checkpoint) != bool(args.run_id):
+        parser.error('--checkpoint and --run-id must be supplied together')
+    if args.resume and not args.checkpoint:
+        parser.error('--resume requires --checkpoint and --run-id')
+    if args.retry_pending and not args.resume:
+        parser.error('--retry-pending requires --resume')
     try:
-        plan = load_plan(args.agent, args.tools, args.runtime, REGISTRY)
-        result = asyncio.run(run(plan, {'request': args.request}, REGISTRY))
-    except (ValidationError, OSError) as exc:
+        registry = REGISTRY
+        if args.llm:
+            from llm_tools import build_registry
+            registry = build_registry(load_yaml(args.llm), load_yaml(args.tools))
+        plan = load_plan(args.agent, args.tools, args.runtime, registry)
+        checkpoint = Checkpoint(args.checkpoint, args.run_id) if args.checkpoint else None
+        result = asyncio.run(run(plan, {'request': args.request}, registry, checkpoint=checkpoint,
+                                 resume=args.resume, retry_pending=args.retry_pending))
+    except (ValidationError, CheckpointError, OSError, sqlite3.Error) as exc:
         parser.exit(2, f'{exc}\n')
     print(json.dumps(result, indent=2))
     return 0 if result['status'] == 'accept' else 1
