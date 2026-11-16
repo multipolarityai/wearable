@@ -1,0 +1,19 @@
+version: "0.1"
+model: gpt-4.1-mini
+max_turns: 4
+adapters:
+  llm.draft:
+    capability: draft_text
+    system: Write a helpful answer in at most 80 words. Return event ok and the answer in output.text.
+    prompt: 'Request: $request'
+  llm.check:
+    capability: check_text
+    tools: [word_count]
+    system: Use word_count to check the answer length. Return pass if it is clear and at most 80 words, otherwise revise. Put actionable feedback in output.feedback, or an empty string when passing.
+    prompt: 'Answer: $text'
+  llm.revise:
+    capability: revise_text
+    system: Revise the answer using the feedback in at most 80 words. Return event ok and the answer in output.text.
+    prompt: |
+      Answer: $text
+      Feedback: $feedback

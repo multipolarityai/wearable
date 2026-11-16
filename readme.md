@@ -2,7 +2,7 @@
 
 A foundation for declarative AI agents: describe a machine in YAML, validate and compile it into a runtime-independent plan, then execute that plan through explicitly registered capabilities.
 
-**Status: minimal working Python prototype.** The v0.1 YAML contract is implemented by a strict loader, validator/compiler and sequential interpreter. The example runs with deterministic offline stub tools; an optional Ollama adapter enables real local inference.
+**Status: minimal working Python prototype.** The v0.1 YAML contract is implemented by a strict loader, validator/compiler and sequential interpreter. The example runs with deterministic offline stub tools; optional Ollama and OpenAI Agents SDK adapters enable local inference or an SDK harness inside each state.
 
 ## Run the prototype
 
@@ -33,6 +33,26 @@ print(result["context"]["values"]["answer"])
 
 `wearable.py` holds the loader, compiler, immutable plan, executor and CLI. `stub_tools.py` holds the three example adapters. An adapter is an `Adapter(inputs, outputs, events, call)` record; the first three arguments are tuples of field/event names and `call` is an async function accepting a dictionary and returning `{event, output}`. The registry is checked at compilation and again before execution. Plans contain declarations, not live functions.
 
+### SDK wearable and evaluation MVP
+
+- [OpenAI Agents SDK adapter](docs/openai-adapter.md): YAML-configured SDK agent with allowlisted tools and a separate inner turn limit.
+- [Traceability and evaluation](docs/evaluation.md): optional SQLite metadata logs, SQL examples, failure evidence and one review/revision property.
+- [Architecture decision](docs/architecture-decision.md): use finite-state analysis only for outer control; use SQL and task-specific tests elsewhere.
+- [Tests and experiments](docs/experiments.md): what was actually validated and what was not.
+
+```sh
+# Offline run with trace logging, then graph and recorded-run checks:
+python -m wearable --trace traces.sqlite --run-id trial-1
+python -m evaluate
+python -m evaluate --trace traces.sqlite --run-id trial-1
+
+# Optional SDK dependency; execution requires OPENAI_API_KEY in the environment:
+python -m pip install -r requirements-openai.txt
+python -m wearable --openai-agents examples/openai-agents.yaml --runtime examples/runtime-llm.yaml
+```
+
+The default tests remain offline. SDK integration tests use the real runner with a scripted model and are skipped if the optional dependency is absent. No arbitrary Python imports can be configured from YAML.
+
 ### Real local inference (optional)
 
 Install [Ollama](https://docs.ollama.com/quickstart) on the machine running the app. Start the Ollama app/service (or run `ollama serve` in another terminal if it is not already running), then:
@@ -50,7 +70,7 @@ The adapter sends a non-streaming [Ollama chat request](https://docs.ollama.com/
 
 Programmatically, construct a registry with `llm_tools.build_registry(load_yaml("examples/llm.yaml"), load_yaml("examples/tools.yaml"))`, then pass it to `load_plan` and `run` in place of `REGISTRY`. The executor owns the overall timeout and the async HTTP client supports cancellation; a disconnected request does not guarantee that the server has stopped computing.
 
-Deployment: run Ollama beside the Python app and use the loopback endpoint. If they run in separate containers, `127.0.0.1` refers to each container itself; configure the endpoint to reach the Ollama service over the private container network. Local Ollama [does not require authentication](https://docs.ollama.com/api/authentication), so keep that service private. This minimal adapter implements the native Ollama API, not arbitrary hosted providers or OpenAI-compatible APIs.
+Deployment: run Ollama beside the Python app and use the loopback endpoint. If they run in separate containers, `127.0.0.1` refers to each container itself; configure the endpoint to reach the Ollama service over the private container network. Local Ollama [does not require authentication](https://docs.ollama.com/api/authentication), so keep that service private. The Ollama adapter implements its native API. The separate OpenAI Agents SDK adapter below uses the SDK runner, not that API.
 
 For a leaner native model server, [llama.cpp](https://github.com/ggml-org/llama.cpp) is another option, but its chat API would need a separate adapter. Hosted inference can avoid downloading weights, although free access and credential-free API access are different: [Hugging Face Inference Providers](https://huggingface.co/docs/inference-providers/en/index) requires a token, and Ollama cloud requires authentication. Public demos are not a dependable backend for this prototype.
 
@@ -79,7 +99,7 @@ SQLite compare-and-swap revisions reject stale writers. This is a single-runner 
 
 Wearable can serve as an overlay around a larger SDK: each state invokes an adapter that runs an SDK agent and translates its final output into `{event, output}`. The outer YAML retains the workflow graph, boundary contracts, budget and checkpoints. The inner SDK retains its own tools, sessions and execution loop.
 
-For example, a `research` state could invoke a Claude agent, return `complete` or `needs_review`, and let Wearable select the next declared state. An OpenAI agent or Google ADK workflow could be used behind another adapter without changing the outer executor. These SDK adapters are extension points, not implemented integrations.
+For example, a `research` state could invoke a Claude agent, return `complete` or `needs_review`, and let Wearable select the next declared state. An OpenAI agent or Google ADK workflow could be used behind another adapter without changing the outer executor. The first concrete implementation is the [OpenAI Agents SDK adapter](docs/openai-adapter.md); Claude/ADK adapters remain future extensions.
 
 Outer constraints do not automatically govern every internal tool call. An invocation budget counts adapter calls, not the inner agent's model/tool calls; its session persistence is also separate. Enforcing those inner permissions, budgets and resumability requires SDK-specific hooks. This boundary is the useful abstraction: inspectable orchestration without recreating every runtime's features. There are no benchmarks claiming a speed or cost advantage over equivalent imperative workflows.
 
@@ -278,27 +298,13 @@ A missing binding or transition after compilation is a host/plan integrity error
 
 A run returns `accept`, `reject`, or `budget_exhausted`, alongside its final state and trace (and context for terminal results). Budget exhaustion is an operational stop, not rejection by the formal machine. The step budget bounds invocations; it bounds elapsed time only when the host reliably enforces action timeouts.
 
-## 6. Optional path toward a Turing machine
+## 6. Why finite-state semantics remain narrow
 
-A future, separate machine profile could replace ordinary context operations with an explicit tape:
+The finite-state abstraction applies to the outer control graph, not arbitrary model reasoning or SDK internals. It supports structural validation and the small review/revision ordering checker. Trace analytics use ordinary SQLite queries. General formal-language and Turing-machine extensions are outside the MVP roadmap.
 
-```text
-T = (Q, Σ, Γ, δ, q₀, q_accept, q_reject, blank)
-δ: (Q × Γ) ⇀ (Q × Γ × {LEFT, RIGHT, STAY})
+See [the architecture decision](docs/architecture-decision.md) for alternatives, concrete benefits and limitations.
 
-STEP_TAPE(state, tape, head):
-    read := tape[head] or blank
-    (next, write, move) := δ[state, read]
-    tape[head] := write
-    head := head + offset(move)
-    return (next, tape, head)
-```
-
-Here Γ is a finite tape alphabet containing the input alphabet Σ and a distinct blank symbol. A potentially unbounded tape, a movable head, and suitable transition programs provide the standard Turing-machine model. A bounded tape remains finite-state; a bounded run is only a finite simulation. Simply adding a list called "memory" or calling an LLM does not establish Turing completeness.
-
-This extension would need a separate YAML grammar, validation rules and executor. It is intentionally not mixed into the initial agent profile. A pushdown profile with a stack could be considered between finite control and a tape if nested workflows become necessary.
-
-## 7. Acceptance cases for a future implementation
+## 7. Core acceptance cases
 
 These behavioral specifications are exercised by the standard-library unittest suite in `tests/test_wearable.py`, using stub adapters without a model service.
 
@@ -319,4 +325,4 @@ These behavioral specifications are exercised by the standard-library unittest s
 
 The prototype implements the safe YAML loader, validation into an immutable Plan, sequential interpreter, and in-memory stub adapter registry. The plan retains validated declarations rather than generating bytecode. Tests cover the cases above plus cancellation, immutable plans, input validation and independent runs.
 
-Additional provider integrations, arbitrary runtime configurations, JSON Schema support, streaming, distributed persistence, parallel states, multi-agent coordination, sandboxing, retries, formal model checking and a tape executor are future work. Supporting new configuration types should mean extending a versioned grammar and adapter contract, not promising that arbitrary YAML can execute.
+Additional provider integrations, arbitrary runtime configurations, JSON Schema support, streaming, distributed persistence, parallel states, multi-agent coordination, sandboxing, automatic retries and richer property checks remain outside this MVP. A tape executor is not on the roadmap. Supporting new configuration types should mean extending a versioned grammar and adapter contract, not promising that arbitrary YAML can execute.

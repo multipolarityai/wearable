@@ -1,0 +1,7 @@
+version: "0.1"
+name: completion-requires-current-review
+before: done
+grant: {state: check, event: pass}
+revoke:
+  - {state: draft, event: ok}
+  - {state: revise, event: ok}

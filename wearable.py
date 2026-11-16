@@ -6,6 +6,10 @@ import asyncio
 import inspect
 import json
 import sqlite3
+import time
+
+from failures import classify
+from trace_log import emit, set_state, trace_context
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
@@ -223,7 +227,24 @@ def load_plan(agent, tools, runtime, registry):
     return compile_agent(load_yaml(agent), load_yaml(tools), load_yaml(runtime), registry)
 
 
-async def run(plan, inputs, registry, *, checkpoint=None, resume=False, retry_pending=False):
+async def run(plan, inputs, registry, *, checkpoint=None, resume=False, retry_pending=False, trace_sink=None):
+    with trace_context(trace_sink):
+        started = time.perf_counter()
+        from checkpoints import fingerprint
+        emit('run.started', resume=resume, workflow_fingerprint=fingerprint(plan.agent),
+             configuration_fingerprint=fingerprint({'agent': plan.agent, 'tools': plan.capabilities,
+                                                    'runtime': plan.runtime,
+                                                    'adapters': {k: v.identity for k, v in registry.items()}}))
+        try:
+            result = await _run(plan, inputs, registry, checkpoint=checkpoint, resume=resume, retry_pending=retry_pending)
+        except BaseException as exc:
+            emit('run.failed', failure=classify(exc, 'wearable'), error=type(exc).__name__, elapsed_ms=(time.perf_counter() - started) * 1000)
+            raise
+        emit('run.completed', status=result['status'], steps=result['steps'], elapsed_ms=(time.perf_counter() - started) * 1000)
+        return result
+
+
+async def _run(plan, inputs, registry, *, checkpoint=None, resume=False, retry_pending=False):
     """Run trusted, cooperative async adapters; cancellation is not rollback."""
     bound = bind(plan, registry)
     fields(inputs, set(plan.agent['inputs']), set(), 'input')
@@ -245,6 +266,7 @@ async def run(plan, inputs, registry, *, checkpoint=None, resume=False, retry_pe
                                  'adapters': {key: registry[key].identity for key in plan.runtime['bindings'].values()}})
         saved = checkpoint.start(signature, snapshot(phase), resume=resume, retry_pending=retry_pending)
         if saved['phase'] == 'done':
+            emit('checkpoint.reused')
             return saved['result']
         state, context, steps, trace, phase = (saved[k] for k in ('state', 'context', 'steps', 'trace', 'phase'))
     while True:
@@ -267,6 +289,9 @@ async def run(plan, inputs, registry, *, checkpoint=None, resume=False, retry_pe
         if checkpoint is not None:
             checkpoint.save(snapshot('pending'))
         phase = 'ready'
+        set_state(state)
+        action_started = time.perf_counter()
+        emit('action.started', step=steps, adapter=plan.runtime['bindings'][spec['action']])
         try:
             async with asyncio.timeout(limits['action_timeout_ms'] / 1000):
                 reply = await bound[spec['action']](args)
@@ -279,6 +304,7 @@ async def run(plan, inputs, registry, *, checkpoint=None, resume=False, retry_pe
         except Exception as exc:
             event, output = 'error', None
             error = type(exc).__name__
+            failure = classify(exc, 'adapter-result')
         target = spec['on'][event]
         if output is not None:
             context['results'][state] = output
@@ -286,6 +312,8 @@ async def run(plan, inputs, registry, *, checkpoint=None, resume=False, retry_pe
         entry = dict(step=steps, state=state, event=event, next=target)
         if output is None:
             entry['error'] = error
+            entry['failure'] = failure
+        emit('action.completed', **entry, elapsed_ms=(time.perf_counter() - action_started) * 1000)
         trace.append(entry)
         state = target
         if checkpoint is not None:
@@ -299,16 +327,19 @@ def main():
     parser.add_argument('--agent', default='examples/agent.yaml')
     parser.add_argument('--tools', default='examples/tools.yaml')
     parser.add_argument('--runtime', default='examples/runtime.yaml')
+    parser.add_argument('--trace', help='SQLite file for append-only event logs')
     parser.add_argument('--checkpoint', help='SQLite file for durable state')
     parser.add_argument('--run-id', help='Run ID within the checkpoint database')
     parser.add_argument('--resume', action='store_true')
     parser.add_argument('--retry-pending', action='store_true', help='Retry an interrupted call only after checking its side effects')
-    parser.add_argument('--llm', help='Ollama model/prompt YAML; omit for offline stubs')
+    providers = parser.add_mutually_exclusive_group()
+    providers.add_argument('--llm', help='Ollama model/prompt YAML')
+    providers.add_argument('--openai-agents', help='OpenAI Agents SDK YAML; omit both providers for stubs')
     parser.add_argument('--request', default='Explain finite-state agents')
     args = parser.parse_args()
     from checkpoints import Checkpoint, CheckpointError
-    if bool(args.checkpoint) != bool(args.run_id):
-        parser.error('--checkpoint and --run-id must be supplied together')
+    if bool(args.checkpoint or args.trace) != bool(args.run_id):
+        parser.error('--checkpoint/--trace requires --run-id, and vice versa')
     if args.resume and not args.checkpoint:
         parser.error('--resume requires --checkpoint and --run-id')
     if args.retry_pending and not args.resume:
@@ -318,9 +349,17 @@ def main():
         if args.llm:
             from llm_tools import build_registry
             registry = build_registry(load_yaml(args.llm), load_yaml(args.tools))
+        if args.openai_agents:
+            try:
+                from openai_wearable import build_registry, demo_tools
+            except ImportError as exc:
+                raise ValidationError('Install requirements-openai.txt to use --openai-agents') from exc
+            registry = build_registry(load_yaml(args.openai_agents), load_yaml(args.tools), tool_registry=demo_tools())
         plan = load_plan(args.agent, args.tools, args.runtime, registry)
         checkpoint = Checkpoint(args.checkpoint, args.run_id) if args.checkpoint else None
-        result = asyncio.run(run(plan, {'request': args.request}, registry, checkpoint=checkpoint,
+        from trace_log import SQLiteTrace
+        trace_sink = SQLiteTrace(args.trace, args.run_id) if args.trace else None
+        result = asyncio.run(run(plan, {'request': args.request}, registry, checkpoint=checkpoint, trace_sink=trace_sink,
                                  resume=args.resume, retry_pending=args.retry_pending))
     except (ValidationError, CheckpointError, OSError, sqlite3.Error) as exc:
         parser.exit(2, f'{exc}\n')
