@@ -2,7 +2,45 @@
 
 A foundation for declarative AI agents: describe a machine in YAML, validate and compile it into a runtime-independent plan, then execute that plan through explicitly registered capabilities.
 
-**Status: algorithmic design sketch.** This repository contains pseudocode and example declarations, not an implemented compiler or runnable agent. The YAML vocabulary is a proposed v0.1 contract. No model provider, execution backend, or programming language is selected yet.
+**Status: minimal working Python prototype.** The v0.1 YAML contract is implemented by a strict loader, validator/compiler and sequential interpreter. The example runs with deterministic offline stub tools; there are no model-provider integrations.
+
+## Run the prototype
+
+Requires Python 3.11 or newer. From the repository root:
+
+```sh
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install -r requirements.txt
+python -m wearable --request "Explain finite-state agents"
+python -m unittest discover -s tests -v
+```
+
+The example prints a JSON result with `status: accept`, `steps: 4`, the revised answer in `context.values.answer`, and the `ok → revise → ok → pass` trace. It makes no network calls and needs no credentials. CLI exit codes are 0 for acceptance, 1 for rejection/budget exhaustion, and 2 for invalid declarations or input files.
+
+Use `--agent`, `--tools` and `--runtime` to select other YAML files. The CLI supplies a single `request` input; use the Python API for other input shapes:
+
+```python
+import asyncio
+from wearable import load_plan, run
+from stub_tools import REGISTRY
+
+plan = load_plan("examples/agent.yaml", "examples/tools.yaml",
+                 "examples/runtime.yaml", REGISTRY)
+result = asyncio.run(run(plan, {"request": "Explain agents"}, REGISTRY))
+print(result["context"]["values"]["answer"])
+```
+
+`wearable.py` holds the loader, compiler, immutable plan, executor and CLI. `stub_tools.py` holds the three example adapters. An adapter is an `Adapter(inputs, outputs, events, call)` record; the first three arguments are tuples of field/event names and `call` is an async function accepting a dictionary and returning `{event, output}`. The registry is checked at compilation and again before execution. Plans contain declarations, not live functions.
+
+### Deliberate prototype limits
+
+- Only string fields, explicit references, sequential execution and the `sequential` backend are supported. All declared capabilities must have compatible registered adapters.
+- PyYAML SafeLoader syntax is used. Quote the `"on"` key, as the examples do, because YAML 1.1 treats bare `on` as a boolean. Duplicate keys, aliases, custom tags and unknown declaration fields are rejected. Documents are limited to 64 KiB and 40 nesting levels.
+- Adapters are trusted, cooperative async Python functions. `asyncio.timeout` cancels an awaiting call; it cannot interrupt blocking code or an adapter that suppresses cancellation. This is not a process sandbox or a hard wall-clock limit. External cancellation propagates, and side effects are not rolled back.
+- Each run has independent context and a bounded invocation count. The returned trace records state/event/target and the exception class on error. Results include context for every status, including budget exhaustion. There are no retries or persistence.
+
+The following sections retain the algorithmic rationale and pseudocode behind the implementation.
 
 ## 1. The smallest useful machine
 
@@ -76,7 +114,7 @@ draft --ok--> check --revise--> revise --ok--> check --pass--> done
 
 Here `draft` and `revise` both write a named result field into `context.values.answer` using `save`. The checker reads it through `{value: answer}`. A value reference is an additional explicit reference form, subject to the same definite-assignment rule. This avoids requiring the checker to know which state last produced the answer. Saved values are string slots, declared in `values`, and are updated only after a successful, contract-valid action result.
 
-The example's model adapters are placeholders. A host would have to implement `llm.draft`, `llm.check`, and `llm.revise`, including any prompts, credentials and provider-specific calls. A model's `pass` event is a routing decision, not proof that its answer is correct.
+The example uses offline stubs under model-style adapter IDs. For real model calls, a host would have to implement `llm.draft`, `llm.check`, and `llm.revise`, including any prompts, credentials and provider-specific calls. A model's `pass` event is a routing decision, not proof that its answer is correct.
 
 ## 4. Compilation algorithm
 
@@ -212,7 +250,7 @@ This extension would need a separate YAML grammar, validation rules and executor
 
 ## 7. Acceptance cases for a future implementation
 
-These are behavioral specifications, not an existing automated test suite. Stub adapters are sufficient to test them without a model service.
+These behavioral specifications are exercised by the standard-library unittest suite in `tests/test_wearable.py`, using stub adapters without a model service.
 
 | Case | Expected result |
 | --- | --- |
@@ -229,6 +267,6 @@ These are behavioral specifications, not an existing automated test suite. Stub 
 
 ## 8. Implementation boundary
 
-The next small implementation could contain just a safe YAML loader, compiler to the Plan structure, sequential interpreter, and in-memory stub adapter registry, with the cases above as tests.
+The prototype implements the safe YAML loader, validation into an immutable Plan, sequential interpreter, and in-memory stub adapter registry. The plan retains validated declarations rather than generating bytecode. Tests cover the cases above plus cancellation, immutable plans, input validation and independent runs.
 
 Provider integrations, arbitrary runtime configurations, JSON Schema support, streaming, persistence, parallel states, multi-agent coordination, sandboxing, retries, formal model checking and a tape executor are future work. Supporting new configuration types should mean extending a versioned grammar and adapter contract, not promising that arbitrary YAML can execute.
