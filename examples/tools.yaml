@@ -1,0 +1,21 @@
+version: "0.1"
+capabilities:
+  draft_text:
+    inputs:
+      request: string
+    outputs:
+      text: string
+    events: [ok]
+  check_text:
+    inputs:
+      text: string
+    outputs:
+      feedback: string
+    events: [pass, revise]
+  revise_text:
+    inputs:
+      text: string
+      feedback: string
+    outputs:
+      text: string
+    events: [ok]

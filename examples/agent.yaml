@@ -1,0 +1,40 @@
+version: "0.1"
+name: draft-and-check
+inputs:
+  request: string
+values:
+  answer: string
+alphabet: [ok, pass, revise, error]
+initial: draft
+states:
+  draft:
+    action: draft_text
+    inputs:
+      request: {input: request}
+    save:
+      answer: text
+    "on":
+      ok: check
+      error: failed
+  check:
+    action: check_text
+    inputs:
+      text: {value: answer}
+    "on":
+      pass: done
+      revise: revise
+      error: failed
+  revise:
+    action: revise_text
+    inputs:
+      text: {value: answer}
+      feedback: {result: check, field: feedback}
+    save:
+      answer: text
+    "on":
+      ok: check
+      error: failed
+  done:
+    terminal: accept
+  failed:
+    terminal: reject
